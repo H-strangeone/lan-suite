@@ -1,0 +1,193 @@
+/*
+  CONCEPT: CSS Custom Properties (Variables)
+  ───────────────────────────────────────────
+  :root is the top-level element (html).
+  Variables defined here are available EVERYWHERE in CSS.
+  Syntax: --variable-name: value;
+  Usage:  color: var(--acid);
+
+  WHY THIS MATTERS:
+  Instead of hardcoding #b8ff35 in 50 places, you define it once.
+  When your designer says "change the accent to cyan", you change
+  one line, not 50. This is called a "design token" system.
+*/
+/* ── Google Fonts import ── */
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@300;400;600&display=swap');
+:root {
+  /* ── Colors ── */
+  --black:     #0a0a0a;
+  --dim:       #111111;
+  --surface:   #161616;
+  --border:    #242424;
+  --border-hi: #333333;
+  --white:     #f0ede8;
+  --muted:     #888888;
+  --dimmed:    #444444;
+
+  /* Accent — this is your brand color. Change here = changes everywhere */
+  --acid:      #b8ff35;
+  --acid-dim:  rgba(184, 255, 53, 0.08);
+  --red:       #ff3b3b;
+  --red-dim:   rgba(255, 59, 59, 0.08);
+  --blue:      #38bdf8;
+
+  /* ── Typography ── */
+  --font-mono: 'IBM Plex Mono', 'Fira Code', 'Consolas', monospace;
+  --font-display: 'Bebas Neue', 'Impact', sans-serif;
+
+  /* Font sizes — rem is relative to html font-size (16px by default) */
+  --text-xs:   0.625rem;   /* 10px */
+  --text-sm:   0.75rem;    /* 12px */
+  --text-base: 0.875rem;   /* 14px */
+  --text-md:   1rem;       /* 16px */
+  --text-lg:   1.25rem;    /* 20px */
+  --text-xl:   1.5rem;     /* 24px */
+
+  /* ── Spacing ── */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+
+  /* ── Transitions ── */
+  --transition-fast: 0.12s ease;
+  --transition-base: 0.2s ease;
+  --transition-slow: 0.4s ease;
+
+  /* ── Layout ── */
+  --sidebar-width: 240px;
+  --topbar-height: 48px;
+  --radius: 2px;  /* We use sharp corners — brutalist aesthetic */
+}
+
+/*
+  CONCEPT: CSS Reset
+  ───────────────────
+  Browsers have different default styles (margin, padding, font sizes).
+  A reset removes all those defaults so you start from zero.
+  box-sizing: border-box means: padding/border are INCLUDED in width.
+  Without it: a 200px div + 20px padding = 240px. Confusing.
+  With it:    a 200px div + 20px padding = 200px. Makes sense.
+*/
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-size: 16px;
+  scroll-behavior: smooth;
+  /* Prevent layout shift when scrollbar appears/disappears */
+  scrollbar-gutter: stable;
+}
+
+body {
+  background-color: var(--black);
+  color: var(--white);
+  font-family: var(--font-mono);
+  font-size: var(--text-base);
+  line-height: 1.6;
+  min-height: 100vh;
+  overflow-x: hidden;
+  cursor: crosshair;
+
+  /* CRT scanline effect — subtle but adds character */
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0px,
+    transparent 3px,
+    rgba(0, 0, 0, 0.04) 3px,
+    rgba(0, 0, 0, 0.04) 4px
+  );
+}
+
+/* Noise overlay — the film grain texture */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  opacity: 0.025;
+  pointer-events: none;
+  z-index: 9999;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* ── Typography resets ── */
+h1, h2, h3, h4, h5, h6 {
+  font-weight: inherit;
+  line-height: 1.1;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  cursor: crosshair;
+  border: none;
+  background: none;
+}
+
+input, textarea, select {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  outline: none;
+}
+
+ul, ol {
+  list-style: none;
+}
+
+img, video {
+  max-width: 100%;
+  display: block;
+}
+
+/* ── Scrollbar styling ── */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--dim);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-hi);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--acid);
+}
+
+/* ── Selection ── */
+::selection {
+  background: var(--acid);
+  color: var(--black);
+}
+
+/* ── Utility classes ── */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
