@@ -1,0 +1,112 @@
+/* ── Overlay ─────────────────────────────────────────────────── */
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 5000;
+  pointer-events: none;
+  /* subtle dark veil while tire is on screen */
+  background: transparent;
+}
+.overlayFade {
+  animation: overlayOut 0.2s ease forwards;
+}
+@keyframes overlayOut {
+  to { opacity: 0; }
+}
+
+/* ── Content behind the transition ──────────────────────────── */
+.content {
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  transform: scale(0.97);
+  transition: opacity 0.25s ease, transform 0.3s cubic-bezier(0.22,1,0.36,1);
+  pointer-events: none;
+}
+.contentVisible {
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: auto;
+}
+
+/* ── Tire ────────────────────────────────────────────────────── */
+.tire {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 72px;
+  height: 72px;
+  /* will be moved left→right via animation phases */
+}
+
+.tireSvg {
+  width: 100%;
+  height: 100%;
+  /* Rolling rotation — synced to horizontal speed */
+  animation: tireRoll linear infinite;
+  animation-duration: 0.4s;
+}
+
+/* Phase: enter — shoots in from left edge */
+.tire_enter {
+  left: -80px;
+  animation: tireEnter 0.32s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+@keyframes tireEnter {
+  from { left: -80px; }
+  to   { left: calc(50vw - 36px); }
+}
+
+/* Phase: spin — sits at centre, spinning in place */
+.tire_spin {
+  left: calc(50vw - 36px);
+  animation: tireSpin 0.4s ease forwards;
+}
+@keyframes tireSpin {
+  /* subtle vertical bounce while spinning */
+  0%,100% { transform: translateY(-50%); }
+  50%      { transform: translateY(calc(-50% - 4px)); }
+}
+
+/* Phase: exit — accelerates off to the right */
+.tire_exit {
+  left: calc(50vw - 36px);
+  animation: tireExit 0.35s cubic-bezier(0.55, 0, 1, 0.45) forwards;
+}
+@keyframes tireExit {
+  from { left: calc(50vw - 36px); }
+  to   { left: calc(100vw + 20px); }
+}
+
+/* Phase: done — off screen right */
+.tire_done {
+  left: calc(100vw + 20px);
+}
+
+/* Speed lines that appear behind the tire during exit */
+.tire_exit::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  right: 100%;
+  transform: translateY(-50%);
+  width: 60px;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, rgba(184,255,53,0.4));
+  animation: speedLine 0.35s ease forwards;
+}
+.tire_exit::after {
+  content: '';
+  position: absolute;
+  top: calc(50% - 10px);
+  right: 100%;
+  transform: translateY(-50%);
+  width: 40px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(184,255,53,0.2));
+  animation: speedLine 0.35s ease forwards;
+}
+@keyframes speedLine {
+  from { width: 0; opacity: 0; }
+  to   { width: 80px; opacity: 1; }
+}

@@ -5,20 +5,30 @@ import "encoding/json"
 type MessageType string
 
 const (
-	TypeJoin      MessageType = "join"
-	TypeLeave     MessageType = "leave"
-	TypeHello     MessageType = "hello"
-	TypeOffer     MessageType = "offer"
-	TypeAnswer    MessageType = "answer"
-	TypeICE       MessageType = "ice"
-	TypeChatMsg   MessageType = "chat_msg"
-	TypePing      MessageType = "ping"
-	TypePeerJoin  MessageType = "peer_join"
-	TypePeerLeft  MessageType = "peer_left"
-	TypePeerList  MessageType = "peer_list"
-	TypePong      MessageType = "pong"
-	TypeError     MessageType = "error"
-	TypeRoomState MessageType = "room_state"
+	TypeJoin          MessageType = "join"
+	TypeLeave         MessageType = "leave"
+	TypeHello         MessageType = "hello"
+	TypeOffer         MessageType = "offer"
+	TypeAnswer        MessageType = "answer"
+	TypeICE           MessageType = "ice"
+	TypeChatMsg       MessageType = "chat_msg"
+	TypePing          MessageType = "ping"
+	TypePeerJoin      MessageType = "peer_join"
+	TypePeerLeft      MessageType = "peer_left"
+	TypePeerList      MessageType = "peer_list"
+	TypePong          MessageType = "pong"
+	TypeError         MessageType = "error"
+	TypeRoomState     MessageType = "room_state"
+	TypeCreateRoom    MessageType = "create_room"
+	TypeRoomList      MessageType = "room_list"
+	TypeRoomListReq   MessageType = "room_list_req"
+	TypeJoinById      MessageType = "join_by_id"
+	TypeCallHangup    MessageType = "call_hangup"
+	TypeCallReject    MessageType = "call_reject"
+	TypeKickMember    MessageType = "kick_member"
+	TypeKicked        MessageType = "kicked"
+	TypeDisbandRoom   MessageType = "disband_room"
+	TypeRoomDisbanded MessageType = "room_disbanded"
 )
 
 type Message struct {
@@ -57,6 +67,16 @@ type PeerLeftPayload struct {
 type ErrorPayload struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+type CreateRoomPayload struct {
+	Name     string `json:"name"`
+	Password string `json:"password,omitempty"`
+}
+
+type JoinByIDPayload struct {
+	RoomID   string `json:"room_id"`
+	Password string `json:"password,omitempty"`
 }
 
 func NewErrorMsg(code, msg string) *Message {

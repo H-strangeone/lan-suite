@@ -1,81 +1,58 @@
 package transport
 
-/*
-  CONCEPT: The Hub Pattern — why one goroutine owns all state
-  ─────────────────────────────────────────────────────────────
-  We have potentially hundreds of clients. Each has its own goroutine.
-  They all need to access shared state: "who is in room X?", "add this client".
-
-  Naive approach: use a mutex (sync.Mutex) to lock the state map.
-    mu.Lock()
-    rooms[roomID] = append(rooms[roomID], client)
-    mu.Unlock()
-
-  Problems with mutexes:
-  - Easy to forget to unlock (deadlock)
-  - Lock contention under high load
-  - Hard to reason about what's protected
-
-  Go's answer: "Don't communicate by sharing memory.
-                Share memory by communicating."
-
-  Hub pattern: ONE goroutine owns ALL shared state.
-  ALL other goroutines communicate with it via CHANNELS.
-  No mutex needed because only one goroutine ever touches the maps.
-
-  ┌──────────────────────────────────────────────────────────────┐
-  │                         Hub Goroutine                         │
-  │                  (the only one touching maps)                 │
-  │                                                               │
-  │   rooms map        clients map                                │
-  │   ─────────────    ───────────                                │
-  │   room → []*Client id → *Client                              │
-  └──────────┬────────────────────────────────────────────────────┘
-             ▲ channels (thread-safe message passing)
-  ┌──────────┴────────────┐
-  │  register   chan *Client        ← new connection
-  │  unregister chan *Client        ← disconnection
-  │  incoming   chan *incomingMsg   ← message from any client
-  └─────────────────────────────────────────────────────────────┘
-
-  Every client goroutine sends to these channels.
-  The hub goroutine reads from them in a select loop.
-  State is ONLY ever modified inside that select loop.
-  Zero race conditions. Zero mutexes. Completely predictable.
-*/
-
 import (
 	"encoding/json"
 	"log"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
-// incomingMsg bundles a message with its sender.
-// This is what client.readPump sends to hub.incoming.
+// ── Interfaces ────────────────────────────────────────────────────────────────
+
+// ChatHandler is the interface the hub uses to process chat messages.
+// Defined here so chat can implement it without an import cycle.
+type ChatHandler interface {
+	HandleMessage(nodeID, displayName, roomID string, payload []byte) error
+}
+
+// RoomRegistry is the interface the hub uses for room auth + creation.
+// Implemented by chat.Manager — defined here to avoid import cycle.
+type RoomRegistry interface {
+	// CreateRoom creates a room and returns its ID, or an error.
+	CreateRoom(name, creatorID, creatorName, password string) (roomID string, err error)
+	// CheckRoomPassword returns nil if password is correct (or room is public).
+	CheckRoomPassword(roomID, password string) error
+	// DeleteRoom permanently removes a room from the registry (used on disband).
+	DeleteRoom(roomID string)
+	// RoomExists returns true if the room ID is known to the registry.
+	RoomExists(roomID string) bool
+	// RoomListJSON returns all rooms as JSON bytes for broadcasting.
+	// member counts come from hub.RoomMemberCounts() passed in.
+	RoomListJSON(memberCounts map[string]int) ([]byte, error)
+}
+
+// ── Hub ───────────────────────────────────────────────────────────────────────
+
 type incomingMsg struct {
 	client *Client
 	msg    *Message
 }
 
-// Hub manages all connected clients and routes messages between them.
-// Run it with: go hub.Run()
+// Hub manages all connected clients and routes messages.
+// ONE goroutine (Run) owns all maps. Everything else sends via channels.
 type Hub struct {
-	// channels — the ONLY way to communicate with the hub goroutine
 	register   chan *Client
 	unregister chan *Client
 	incoming   chan *incomingMsg
 
-	// state — ONLY touched inside Run()'s select loop
-	// clients: all connected clients indexed by nodeID
-	clients map[string]*Client
-	// rooms: roomID → set of clients in that room
-	// We use map[*Client]bool as a set — Go has no built-in set type.
-	// map[*Client]bool where value is always true is idiomatic Go set.
-	rooms map[string]map[*Client]bool
+	clients map[string]*Client          // nodeID → client
+	rooms   map[string]map[*Client]bool // roomID → members
+
+	chatHandler ChatHandler
+	roomReg     RoomRegistry
 }
 
-// NewHub creates a Hub. Call hub.Run() in a goroutine to start it.
 func NewHub() *Hub {
 	return &Hub{
 		register:   make(chan *Client, 64),
@@ -86,49 +63,27 @@ func NewHub() *Hub {
 	}
 }
 
-// Run starts the hub's event loop. Must be called in its own goroutine:
-//   go hub.Run()
-//
-// This function runs forever (until the process exits).
-// It is the ONLY place that reads/writes hub.clients and hub.rooms.
+func (h *Hub) SetChatHandler(ch ChatHandler) { h.chatHandler = ch }
+func (h *Hub) SetRoomRegistry(rr RoomRegistry) { h.roomReg = rr }
+
+// Run is the hub's single-threaded event loop.
 func (h *Hub) Run() {
 	log.Println("[hub] started")
 	for {
-		/*
-		  CONCEPT: The central select loop
-		  ──────────────────────────────────
-		  This select handles three types of events:
-		  1. A new client connects (register)
-		  2. A client disconnects (unregister)
-		  3. A client sends a message (incoming)
-
-		  Go processes exactly ONE case per iteration.
-		  Events queue up in the channels while hub is processing another event.
-		  This serializes all state mutations — safe by construction.
-		*/
 		select {
-
-		case client := <-h.register:
-			h.handleRegister(client)
-
-		case client := <-h.unregister:
-			h.handleUnregister(client)
-
+		case c := <-h.register:
+			h.handleRegister(c)
+		case c := <-h.unregister:
+			h.handleUnregister(c)
 		case im := <-h.incoming:
 			h.handleMessage(im.client, im.msg)
 		}
 	}
 }
 
-// ── Event handlers ────────────────────────────────────────────────────────────
-// These are called from inside Run()'s select loop.
-// They can safely read/write hub.clients and hub.rooms.
+// ── Registration ──────────────────────────────────────────────────────────────
 
 func (h *Hub) handleRegister(c *Client) {
-	// A client just connected and upgraded to WebSocket.
-	// They haven't identified themselves yet (no hello message).
-	// We give them a temporary placeholder ID.
-	// Real identity is set when they send TypeHello.
 	tempID := "pending-" + c.conn.RemoteAddr().String()
 	c.nodeID = tempID
 	h.clients[tempID] = c
@@ -136,266 +91,454 @@ func (h *Hub) handleRegister(c *Client) {
 }
 
 func (h *Hub) handleUnregister(c *Client) {
-	// Client disconnected — clean up everywhere.
-
-	// 1. Remove from any room they were in
 	if c.currentRoom != "" {
 		h.leaveRoom(c)
 	}
-
-	// 2. Remove from global clients map
-	delete(h.clients, c.nodeID)
-
-	// 3. Close their send channel — signals writePump to exit
-	//    IMPORTANT: only close a channel from the SENDER side.
-	//    Hub is the sender (writes to c.send), so hub closes it.
-	//    writePump is the receiver — it will see the close and exit.
-	close(c.send)
-
-	log.Printf("[hub] unregistered: %s", c.identity())
+	if h.clients[c.nodeID] == c {
+		delete(h.clients, c.nodeID)
+	}
+	safeClose(c.send)
+	log.Printf("[hub] unregistered: %s", c.logID())
 }
 
+// ── Message dispatch ──────────────────────────────────────────────────────────
+
 func (h *Hub) handleMessage(c *Client, msg *Message) {
-	// c is nil for internal notifications (e.g. from discovery).
-	// These are broadcast-only messages — no sender to reply to.
 	if c == nil {
+		// Internal notification from discovery or chat manager
 		switch msg.Type {
 		case TypePeerJoin, TypePeerLeft:
-			// Broadcast to all connected clients
-			for _, client := range h.clients {
-				client.sendMsg(msg)
+			for _, cl := range h.clients {
+				// __lan__ discovery events fire every 5 s from the discovery loop.
+				// Clients already inside a real room have authoritative peer state
+				// from room-scoped events (peer_list / peer_join / peer_left).
+				// Sending __lan__ to them is redundant noise that causes the frontend
+				// peer list to grow on every tick even with dedup logic in place.
+				if msg.Room == "__lan__" && cl.currentRoom != "" {
+					continue
+				}
+				cl.sendMsg(msg)
+			}
+		case TypeChatMsg:
+			h.broadcastRoom(msg.Room, msg, nil)
+		case TypeRoomList:
+			// Broadcast updated room list to all clients
+			for _, cl := range h.clients {
+				cl.sendMsg(msg)
 			}
 		}
 		return
 	}
 
-	// Route based on message type
 	switch msg.Type {
-
 	case TypeHello:
 		h.handleHello(c, msg)
-
+	case TypeCreateRoom:
+		h.handleCreateRoom(c, msg)
 	case TypeJoin:
-		h.handleJoin(c, msg)
-
+		h.handleJoin(c, msg) // join by name (default/public rooms)
+	case TypeJoinById:
+		h.handleJoinByID(c, msg) // join by UUID with optional password
+	case TypeRoomListReq:
+		h.handleRoomListReq(c)
 	case TypeLeave:
 		h.leaveRoom(c)
-
+		c.sendMsg(&Message{Type: TypePeerList, Payload: []byte(`{"peers":[]}`)}) // confirm left
 	case TypePing:
 		c.sendMsg(NewPongMsg())
-
-	// WebRTC signaling — server relays these without reading the payload
-	case TypeOffer, TypeAnswer, TypeICE:
+	case TypeOffer, TypeAnswer, TypeICE, TypeCallHangup, TypeCallReject:
 		h.handleSignaling(c, msg)
-
-	// Chat message — broadcast to room or direct to peer
+	case TypeKickMember:
+		h.handleKick(c, msg)
+	case TypeDisbandRoom:
+		h.handleDisband(c, msg)
 	case TypeChatMsg:
 		h.handleChat(c, msg)
-
 	default:
 		c.sendMsg(NewErrorMsg("unknown_type", "unknown message type: "+string(msg.Type)))
 	}
 }
 
-// ── Message-specific handlers ─────────────────────────────────────────────────
+// ── Hello ─────────────────────────────────────────────────────────────────────
 
 func (h *Hub) handleHello(c *Client, msg *Message) {
-	// Parse the hello payload to get client's identity
 	var hello HelloPayload
 	if err := json.Unmarshal(msg.Payload, &hello); err != nil {
 		c.sendMsg(NewErrorMsg("bad_hello", "hello payload must have display_name, node_id, services"))
 		return
 	}
 
-	// Validate display_name
 	hello.DisplayName = strings.TrimSpace(hello.DisplayName)
+	hello.NodeID = strings.TrimSpace(hello.NodeID)
+
 	if hello.DisplayName == "" || utf8.RuneCountInString(hello.DisplayName) > 64 {
 		c.sendMsg(NewErrorMsg("bad_hello", "display_name must be 1-64 characters"))
 		return
 	}
-
-	// Validate node_id — must be non-empty
-	hello.NodeID = strings.TrimSpace(hello.NodeID)
 	if hello.NodeID == "" {
 		c.sendMsg(NewErrorMsg("bad_hello", "node_id is required"))
 		return
 	}
 
-	// Re-key the client in our map (was "pending-addr", now real nodeID)
-	// This is why we use nodeID as the map key — it changes after hello.
+	// SECURITY: hello.NodeID must match JWT claim — client cannot forge identity
+	if hello.NodeID != c.identity.NodeID {
+		c.sendMsg(NewErrorMsg("bad_hello", "node_id must match your token"))
+		return
+	}
+
+	// Re-key: delete pending entry, insert real nodeID
 	delete(h.clients, c.nodeID)
+	if existing, ok := h.clients[hello.NodeID]; ok && existing != c {
+		log.Printf("[hub] evicting duplicate connection for %s", safeID(hello.NodeID))
+		if existing.currentRoom != "" {
+			h.leaveRoom(existing)
+		}
+		safeClose(existing.send)
+		delete(h.clients, hello.NodeID)
+	}
 	c.nodeID = hello.NodeID
 	c.displayName = hello.DisplayName
 	c.services = hello.Services
 	h.clients[c.nodeID] = c
 
-	log.Printf("[hub] hello from %s services=%v", c.identity(), c.services)
+	log.Printf("[hub] hello from %s services=%v", c.logID(), c.services)
 }
 
-func (h *Hub) handleJoin(c *Client, msg *Message) {
-	// Validate room name
-	room := strings.TrimSpace(msg.Room)
-	if room == "" {
-		c.sendMsg(NewErrorMsg("bad_room", "room name cannot be empty"))
-		return
-	}
-	if len(room) > 128 {
-		c.sendMsg(NewErrorMsg("bad_room", "room name must be 128 characters or fewer"))
-		return
-	}
-	// Only allow alphanumeric, hyphen, underscore — prevent path traversal
-	// and other injection attacks via room names
-	if !isValidRoomName(room) {
-		c.sendMsg(NewErrorMsg("bad_room", "room name may only contain letters, numbers, hyphens, and underscores"))
+// ── Room creation ─────────────────────────────────────────────────────────────
+
+func (h *Hub) handleCreateRoom(c *Client, msg *Message) {
+	if h.roomReg == nil {
+		c.sendMsg(NewErrorMsg("unavailable", "room registry not ready"))
 		return
 	}
 
-	// Leave current room if in one
+	var req CreateRoomPayload
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		c.sendMsg(NewErrorMsg("bad_payload", "expected {name, password?}"))
+		return
+	}
+	req.Name = strings.TrimSpace(strings.ToLower(req.Name))
+	if req.Name == "" || len(req.Name) > 64 || !isValidRoomName(req.Name) {
+		c.sendMsg(NewErrorMsg("bad_room", "name must be lowercase a-z 0-9 - _ and max 64 chars"))
+		return
+	}
+
+	roomID, err := h.roomReg.CreateRoom(req.Name, c.nodeID, c.displayName, req.Password)
+	if err != nil {
+		c.sendMsg(NewErrorMsg("create_failed", err.Error()))
+		return
+	}
+
+	log.Printf("[hub] room created: %q (%s) by %s", req.Name, roomID, c.logID())
+
+	// Broadcast updated room list to ALL clients immediately
+	h.broadcastRoomList()
+
+	// Auto-join creator into the new room
+	h.joinRoomByID(c, roomID, "")
+}
+
+// ── Room list ─────────────────────────────────────────────────────────────────
+
+func (h *Hub) handleRoomListReq(c *Client) {
+	if h.roomReg == nil {
+		return
+	}
+	data, err := h.roomReg.RoomListJSON(h.RoomMemberCounts())
+	if err != nil {
+		return
+	}
+	c.sendMsg(&Message{Type: TypeRoomList, Payload: data})
+}
+
+// broadcastRoomList sends the full room list to every connected client.
+// Called after a room is created so all open tabs update instantly.
+func (h *Hub) broadcastRoomList() {
+	if h.roomReg == nil {
+		return
+	}
+	data, err := h.roomReg.RoomListJSON(h.RoomMemberCounts())
+	if err != nil {
+		return
+	}
+	msg := &Message{Type: TypeRoomList, Payload: data}
+	for _, cl := range h.clients {
+		cl.sendMsg(msg)
+	}
+}
+
+// ── Join by name (legacy/default rooms) ──────────────────────────────────────
+
+func (h *Hub) handleJoin(c *Client, msg *Message) {
+	room := strings.TrimSpace(msg.Room)
+	if room == "" || len(room) > 128 || !isValidRoomName(room) {
+		c.sendMsg(NewErrorMsg("bad_room", "invalid room name"))
+		return
+	}
+
+	// For default rooms, name == ID. Check registry by the room value directly.
+	if h.roomReg != nil && !h.roomReg.RoomExists(room) {
+		c.sendMsg(NewErrorMsg("room_not_found", "room not found — use join_by_id for user-created rooms"))
+		return
+	}
+
+	h.joinRoomByID(c, room, "")
+}
+
+// ── Join by UUID ──────────────────────────────────────────────────────────────
+
+func (h *Hub) handleJoinByID(c *Client, msg *Message) {
+	var req JoinByIDPayload
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		c.sendMsg(NewErrorMsg("bad_payload", "expected {room_id, password?}"))
+		return
+	}
+	req.RoomID = strings.TrimSpace(req.RoomID)
+	if req.RoomID == "" {
+		c.sendMsg(NewErrorMsg("bad_room", "room_id required"))
+		return
+	}
+
+	if h.roomReg != nil {
+		if !h.roomReg.RoomExists(req.RoomID) {
+			c.sendMsg(NewErrorMsg("room_not_found", "room not found"))
+			return
+		}
+		if err := h.roomReg.CheckRoomPassword(req.RoomID, req.Password); err != nil {
+			c.sendMsg(NewErrorMsg("wrong_password", err.Error()))
+			return
+		}
+	}
+
+	h.joinRoomByID(c, req.RoomID, req.Password)
+}
+
+// joinRoomByID does the actual room join — shared by handleJoin and handleJoinByID.
+func (h *Hub) joinRoomByID(c *Client, roomID, _ string) {
 	if c.currentRoom != "" {
 		h.leaveRoom(c)
 	}
 
-	// Create room if it doesn't exist
-	if h.rooms[room] == nil {
-		h.rooms[room] = make(map[*Client]bool)
+	if h.rooms[roomID] == nil {
+		h.rooms[roomID] = make(map[*Client]bool)
 	}
+	h.rooms[roomID][c] = true
+	c.currentRoom = roomID
 
-	// Add client to room
-	h.rooms[room][c] = true
-	c.currentRoom = room
-
-	// Build peer list of everyone currently in the room (excluding the newcomer)
 	var peers []PeerInfo
-	for peer := range h.rooms[room] {
+	for peer := range h.rooms[roomID] {
 		if peer != c {
 			peers = append(peers, peer.asPeerInfo())
 		}
 	}
 	if peers == nil {
-		peers = []PeerInfo{} // never send null, always send empty array
+		peers = []PeerInfo{}
 	}
 
-	// Tell the newcomer who's already here
-	c.sendMsg(NewPeerListMsg(room, peers))
+	c.sendMsg(NewPeerListMsg(roomID, peers))
+	h.broadcastRoom(roomID, NewPeerJoinMsg(roomID, c.asPeerInfo()), c)
 
-	// Tell everyone else that a new peer joined
-	joinMsg := NewPeerJoinMsg(room, c.asPeerInfo())
-	h.broadcastRoom(room, joinMsg, c) // exclude the newcomer (they know they joined)
-
-	log.Printf("[hub] %s joined room %q (%d peers)", c.identity(), room, len(h.rooms[room]))
+	log.Printf("[hub] %s joined room %q (%d peers)", c.logID(), roomID, len(h.rooms[roomID]))
 }
+
+// ── Leave ─────────────────────────────────────────────────────────────────────
 
 func (h *Hub) leaveRoom(c *Client) {
 	room := c.currentRoom
 	if room == "" {
 		return
 	}
-
-	// Remove from room
 	delete(h.rooms[room], c)
 	c.currentRoom = ""
 
-	// Clean up empty rooms — don't let the map grow forever
 	if len(h.rooms[room]) == 0 {
 		delete(h.rooms, room)
-		log.Printf("[hub] room %q deleted (empty)", room)
+		log.Printf("[hub] room %q empty", room)
 	} else {
-		// Tell remaining peers this client left
-		leftMsg := NewPeerLeftMsg(room, c.nodeID)
-		h.broadcastRoom(room, leftMsg, nil) // nil = send to everyone
-		log.Printf("[hub] %s left room %q (%d peers remain)", c.identity(), room, len(h.rooms[room]))
+		h.broadcastRoom(room, NewPeerLeftMsg(room, c.nodeID), nil)
+		log.Printf("[hub] %s left room %q", c.logID(), room)
 	}
+
+	// Update room list counts after someone leaves
+	go func() {
+		select {
+		case h.incoming <- &incomingMsg{client: nil, msg: &Message{Type: TypeRoomList}}:
+		default:
+		}
+	}()
 }
+
+// ── Signaling ─────────────────────────────────────────────────────────────────
+// Routes offer/answer/ice/call_hangup/call_reject to any connected peer by node_id.
+// No room membership required — a call should work regardless of what screen
+// the callee is on. msg.From is stamped here so the receiver always knows the caller.
 
 func (h *Hub) handleSignaling(c *Client, msg *Message) {
-	/*
-	  CONCEPT: WebRTC Signaling Relay
-	  ──────────────────────────────────
-	  The server's job for WebRTC is minimal:
-	  - Client A sends offer → server forwards to everyone in the room
-	  - Client B sends answer → server forwards to everyone in the room
-	  - Both send ICE candidates → server forwards to everyone in the room
-
-	  The server NEVER reads the SDP or ICE payload. It's opaque.
-	  The server is just a mailman — deliver to the right room.
-
-	  DIRECTED messages (msg.To is set):
-	  Forward only to the specific target peer.
-	  Used in multi-party calls where you want to offer to a specific peer.
-
-	  BROADCAST messages (msg.To is empty):
-	  Forward to everyone in the room except the sender.
-	  Simpler but only works for 1-to-1 rooms.
-	*/
-	if c.currentRoom == "" {
-		c.sendMsg(NewErrorMsg("not_in_room", "join a room before sending signaling messages"))
+	if msg.To == "" {
+		c.sendMsg(NewErrorMsg("no_target", "signaling requires msg.to"))
 		return
 	}
-
-	if msg.To != "" {
-		// Directed: send only to the target peer
-		target := h.clients[msg.To]
-		if target == nil {
-			c.sendMsg(NewErrorMsg("peer_not_found", "target peer is not connected"))
-			return
-		}
-		// Make sure target is in the same room — prevent cross-room snooping
-		if target.currentRoom != c.currentRoom {
-			c.sendMsg(NewErrorMsg("peer_not_in_room", "target peer is not in your room"))
-			return
-		}
-		target.sendMsg(msg)
-	} else {
-		// Broadcast to room
-		h.broadcastRoom(c.currentRoom, msg, c)
+	target := h.clients[msg.To]
+	if target == nil {
+		c.sendMsg(NewErrorMsg("peer_not_found", "target peer is not connected"))
+		return
 	}
+	msg.From = c.nodeID // stamp sender identity
+	target.sendMsg(msg)
 }
+
+// ── Kick member ───────────────────────────────────────────────────────────────
+// Only the creator of a room (checked client-side via room meta) can kick.
+// Hub enforces: kicker must be in the same room as the target.
+
+func (h *Hub) handleKick(c *Client, msg *Message) {
+	var req struct {
+		NodeID string `json:"node_id"`
+	}
+	if err := json.Unmarshal(msg.Payload, &req); err != nil || req.NodeID == "" {
+		c.sendMsg(NewErrorMsg("bad_payload", "kick requires {node_id}"))
+		return
+	}
+	if c.currentRoom == "" {
+		c.sendMsg(NewErrorMsg("not_in_room", "you are not in a room"))
+		return
+	}
+	target := h.clients[req.NodeID]
+	if target == nil {
+		c.sendMsg(NewErrorMsg("peer_not_found", "target not connected"))
+		return
+	}
+	if target.currentRoom != c.currentRoom {
+		c.sendMsg(NewErrorMsg("peer_not_in_room", "target not in your room"))
+		return
+	}
+	// Tell the kicked peer to leave
+	target.sendMsg(&Message{Type: TypeKicked, Room: c.currentRoom})
+	h.leaveRoom(target)
+	log.Printf("[hub] %s kicked %s from %s", c.logID(), safeID(req.NodeID), c.currentRoom)
+}
+
+// ── Disband room ──────────────────────────────────────────────────────────────
+// Notifies all members, forces them out, deletes the room from the hub.
+
+func (h *Hub) handleDisband(c *Client, msg *Message) {
+	room := c.currentRoom
+	if room == "" {
+		c.sendMsg(NewErrorMsg("not_in_room", "you are not in a room"))
+		return
+	}
+	disbanded := &Message{Type: TypeRoomDisbanded, Room: room}
+	// Collect members first — can't iterate while modifying
+	members := make([]*Client, 0, len(h.rooms[room]))
+	for cl := range h.rooms[room] {
+		members = append(members, cl)
+	}
+	// Notify and remove
+	for _, cl := range members {
+		cl.sendMsg(disbanded)
+		cl.currentRoom = ""
+	}
+	delete(h.rooms, room)
+	// Remove from persistent registry so it never appears in room lists again
+	if h.roomReg != nil {
+		h.roomReg.DeleteRoom(room)
+	}
+	log.Printf("[hub] room %s disbanded by %s", room, c.logID())
+	h.broadcastRoomList()
+}
+
+// ── Chat ──────────────────────────────────────────────────────────────────────
 
 func (h *Hub) handleChat(c *Client, msg *Message) {
 	if c.currentRoom == "" {
 		c.sendMsg(NewErrorMsg("not_in_room", "join a room before sending messages"))
 		return
 	}
-
-	// Validate chat payload size — prevent huge messages
 	if len(msg.Payload) > 4*1024 {
 		c.sendMsg(NewErrorMsg("message_too_large", "chat message must be under 4KB"))
 		return
 	}
-
-	// Stamp the room and relay — server doesn't read the message content
 	msg.Room = c.currentRoom
-	h.broadcastRoom(c.currentRoom, msg, nil) // nil = send to everyone including sender
+
+	if h.chatHandler != nil {
+		if err := h.chatHandler.HandleMessage(c.nodeID, c.displayName, c.currentRoom, msg.Payload); err != nil {
+			c.sendMsg(NewErrorMsg("chat_error", err.Error()))
+		}
+		return
+	}
+	h.broadcastRoom(c.currentRoom, msg, nil)
 }
 
 // ── Broadcast helpers ─────────────────────────────────────────────────────────
 
-// broadcastRoom sends a message to all clients in a room.
-// If exclude is non-nil, that client is skipped (used for join notifications
-// where we don't echo back to the sender).
 func (h *Hub) broadcastRoom(room string, msg *Message, exclude *Client) {
-	peers, ok := h.rooms[room]
-	if !ok {
-		return
-	}
-	for client := range peers {
-		if client != exclude {
-			client.sendMsg(msg)
+	for cl := range h.rooms[room] {
+		if cl != exclude {
+			cl.sendMsg(msg)
 		}
 	}
 }
 
-// Stats returns a snapshot of hub state for the health/metrics endpoint.
-// Safe to call from outside the hub goroutine? NO — but for a metrics
-// endpoint, a slightly stale count is acceptable.
-// For strict correctness we'd send a request through a channel.
-// That's over-engineering for a debug endpoint.
+// ── Stats ─────────────────────────────────────────────────────────────────────
+
 func (h *Hub) Stats() (clients, rooms int) {
 	return len(h.clients), len(h.rooms)
 }
 
-// isValidRoomName allows only: a-z A-Z 0-9 - _
-// Rejects anything that could be used for injection or path traversal.
+// RoomMemberCounts returns a map of roomID → current live member count.
+// Called by the room registry when building room list payloads.
+func (h *Hub) RoomMemberCounts() map[string]int {
+	counts := make(map[string]int, len(h.rooms))
+	for roomID, members := range h.rooms {
+		counts[roomID] = len(members)
+	}
+	return counts
+}
+
+// ── Discovery notifications ───────────────────────────────────────────────────
+
+func (h *Hub) NotifyPeerJoined(nodeID, displayName string, services []string) {
+	msg := NewPeerJoinMsg("__lan__", PeerInfo{
+		NodeID: nodeID, DisplayName: displayName, Services: services,
+	})
+	select {
+	case h.incoming <- &incomingMsg{client: nil, msg: msg}:
+	default:
+		log.Printf("[hub] notify full, dropping peer_join for %s", safeID(nodeID))
+	}
+}
+
+func (h *Hub) NotifyPeerLeft(nodeID string) {
+	msg := NewPeerLeftMsg("__lan__", nodeID)
+	select {
+	case h.incoming <- &incomingMsg{client: nil, msg: msg}:
+	default:
+		log.Printf("[hub] notify full, dropping peer_left for %s", safeID(nodeID))
+	}
+}
+
+func (h *Hub) BroadcastToRoom(roomID string, msg *Message) {
+	select {
+	case h.incoming <- &incomingMsg{client: nil, msg: msg}:
+	default:
+		log.Printf("[hub] broadcast full, dropping %s to %s", msg.Type, roomID)
+	}
+}
+
+// ── Safe helpers ──────────────────────────────────────────────────────────────
+
+func safeClose(ch chan *Message) {
+	defer func() { recover() }()
+	close(ch)
+}
+
+func safeID(s string) string {
+	if len(s) <= 8 {
+		return s
+	}
+	return s[:8]
+}
+
 func isValidRoomName(name string) bool {
 	for _, r := range name {
 		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
@@ -406,34 +549,4 @@ func isValidRoomName(name string) bool {
 	return true
 }
 
-// ── External notifications ────────────────────────────────────────────────────
-// Called by discovery when a peer appears/disappears on the LAN.
-// These broadcast to all WebSocket clients so the frontend updates instantly.
-
-// NotifyPeerJoined broadcasts a peer_join event to all connected clients.
-// Called by discovery when a new LAN peer is found via UDP multicast.
-func (h *Hub) NotifyPeerJoined(nodeID, displayName string, services []string) {
-	msg := NewPeerJoinMsg("__lan__", PeerInfo{
-		NodeID:      nodeID,
-		DisplayName: displayName,
-		Services:    services,
-	})
-	// Send through the incoming channel so the hub goroutine handles it safely.
-	// We cannot touch h.clients directly from outside the Run() goroutine.
-	select {
-	case h.incoming <- &incomingMsg{client: nil, msg: msg}:
-	default:
-		log.Printf("[hub] notify channel full, dropping peer_join for %s", nodeID[:8])
-	}
-}
-
-// NotifyPeerLeft broadcasts a peer_left event to all connected clients.
-// Called by discovery when a LAN peer times out.
-func (h *Hub) NotifyPeerLeft(nodeID string) {
-	msg := NewPeerLeftMsg("__lan__", nodeID)
-	select {
-	case h.incoming <- &incomingMsg{client: nil, msg: msg}:
-	default:
-		log.Printf("[hub] notify channel full, dropping peer_left for %s", nodeID[:8])
-	}
-}
+var _ = time.Second

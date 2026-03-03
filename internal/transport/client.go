@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/H-strangeone/lan-suite/internal/identity"
 )
 
 const (
@@ -16,20 +18,28 @@ const (
 )
 
 type Client struct {
-	hub         *Hub
-	conn        *websocket.Conn
-	send        chan *Message
+	hub  *Hub
+	conn *websocket.Conn
+	send chan *Message
+
 	nodeID      string
 	displayName string
 	services    []string
 	currentRoom string
+
+	identity *identity.Claims
 }
 
-func newClient(hub *Hub, conn *websocket.Conn) *Client {
+func newClient(hub *Hub, conn *websocket.Conn, claims *identity.Claims) *Client {
 	return &Client{
 		hub:  hub,
 		conn: conn,
 		send: make(chan *Message, 256),
+
+		identity:    claims,
+		nodeID:      claims.NodeID,
+		displayName: claims.DisplayName,
+		services:    claims.Services,
 	}
 }
 
@@ -37,7 +47,7 @@ func (c *Client) readPump() {
 	defer func() {
 		c.hub.unregister <- c
 		c.conn.Close()
-		log.Printf("[ws] disconnected: %s", c.identity())
+		log.Printf("[ws] disconnected: %s", c.logID())
 	}()
 
 	c.conn.SetReadLimit(maxMessageSize)
@@ -50,12 +60,13 @@ func (c *Client) readPump() {
 	for {
 		_, rawBytes, err := c.conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err,
+			if websocket.IsUnexpectedCloseError(
+				err,
 				websocket.CloseGoingAway,
 				websocket.CloseNormalClosure,
 				websocket.CloseNoStatusReceived,
 			) {
-				log.Printf("[ws] unexpected close %s: %v", c.identity(), err)
+				log.Printf("[ws] unexpected close %s: %v", c.logID(), err)
 			}
 			return
 		}
@@ -71,7 +82,7 @@ func (c *Client) readPump() {
 		select {
 		case c.hub.incoming <- &incomingMsg{client: c, msg: &msg}:
 		default:
-			log.Printf("[ws] hub overloaded, dropping from %s", c.identity())
+			log.Printf("[ws] hub overloaded, dropping from %s", c.logID())
 		}
 	}
 }
@@ -87,19 +98,22 @@ func (c *Client) writePump() {
 		select {
 		case msg, ok := <-c.send:
 			if !ok {
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+
+				c.conn.WriteMessage(websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, "replaced"))
 				return
 			}
+
 			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := c.conn.WriteJSON(msg); err != nil {
-				log.Printf("[ws] write error %s: %v", c.identity(), err)
+				log.Printf("[ws] write error %s: %v", c.logID(), err)
 				return
 			}
 
 		case <-ticker.C:
 			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				log.Printf("[ws] ping error %s: %v", c.identity(), err)
+				log.Printf("[ws] ping error %s: %v", c.logID(), err)
 				return
 			}
 		}
@@ -110,11 +124,11 @@ func (c *Client) sendMsg(msg *Message) {
 	select {
 	case c.send <- msg:
 	default:
-		log.Printf("[ws] send buffer full for %s — dropping %s", c.identity(), msg.Type)
+		log.Printf("[ws] send buffer full for %s — dropping %s", c.logID(), msg.Type)
 	}
 }
 
-func (c *Client) identity() string {
+func (c *Client) logID() string {
 	name := c.displayName
 	if name == "" {
 		name = "anon"
@@ -131,31 +145,50 @@ func (c *Client) asPeerInfo() PeerInfo {
 	if svcs == nil {
 		svcs = []string{}
 	}
-	return PeerInfo{NodeID: c.nodeID, DisplayName: c.displayName, Services: svcs}
+	return PeerInfo{
+		NodeID:      c.nodeID,
+		DisplayName: c.displayName,
+		Services:    svcs,
+	}
 }
 
-func ServeWS(hub *Hub, allowedOrigins map[string]bool) http.HandlerFunc {
-	u := websocket.Upgrader{
+func ServeWS(hub *Hub, jwtMgr *identity.Manager, allowedOrigins map[string]bool) http.HandlerFunc {
+	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
 		CheckOrigin: func(r *http.Request) bool {
-			origin := r.Header.Get("Origin")
-			if origin == "" {
-				return len(allowedOrigins) == 0
-			}
-			return allowedOrigins[origin]
+			return true
 		},
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
-		conn, err := u.Upgrade(w, r, nil)
-		if err != nil {
-			log.Printf("[ws] upgrade failed from %s: %v", r.RemoteAddr, err)
+		log.Println("[ws] HIT")
+
+		token := r.URL.Query().Get("token")
+		if token == "" {
+			log.Println("[ws] missing token")
+			http.Error(w, "missing token", http.StatusUnauthorized)
 			return
 		}
 
-		client := newClient(hub, conn)
+		claims, err := jwtMgr.Verify(token)
+		if err != nil {
+			log.Println("[ws] invalid token:", err)
+			http.Error(w, "invalid token", http.StatusUnauthorized)
+			return
+		}
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Println("[ws] upgrade error:", err)
+			return
+		}
+
+		log.Println("[ws] CONNECTED:", claims.DisplayName)
+
+		client := newClient(hub, conn, claims)
 		hub.register <- client
+
 		go client.writePump()
 		go client.readPump()
 	}
